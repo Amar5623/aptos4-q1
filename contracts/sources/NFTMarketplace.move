@@ -160,14 +160,38 @@ address 0xa256fddba13780914e70b6f74cf24af7548e796ad8dcbf331c85c93327f99ec4{
         const ERROR_OFFER_NOT_FOUND: u64 = 11;
         const ERROR_OFFER_NOT_PENDING: u64 = 12;
         const ERROR_OFFER_EXPIRED: u64 = 13;
+        const ERROR_ALREADY_INITIALIZED: u64 = 1001;
 
-        // TODO# 6: Initialize Marketplace        
+
+        // TODO# 6: Initialize Marketplace  
+
         public entry fun initialize(account: &signer) {
             let marketplace = Marketplace {
                 nfts: vector::empty<NFT>()
             };
             move_to(account, marketplace);
         }
+              
+        public entry fun initialize_marketplace(
+            marketplace: &signer
+        ) {
+            let addr = signer::address_of(marketplace);
+
+            // Ensure MarketplaceData isn't already initialized
+            assert!(exists<MarketplaceData>(addr) == false, ERROR_ALREADY_INITIALIZED);
+
+            // Initialize the resource
+            move_to(
+                marketplace,
+                MarketplaceData {
+                    offer_escrow: coin::zero<AptosCoin>(), // Initialize empty escrow
+                    offers: table::new<u64, Offer>(),      // Initialize empty offers table
+                    listings: table::new<u64, Listing>(),  // Initialize empty listings table (or appropriate type)
+                    next_offer_id: 0                       // Start with offer ID 0
+                }
+            );
+        }
+
 
         // TODO# 7: Check Marketplace Initialization
         #[view]
@@ -379,6 +403,54 @@ address 0xa256fddba13780914e70b6f74cf24af7548e796ad8dcbf331c85c93327f99ec4{
                 // Store or handle the NFT appropriately
                 let NFT { id: _, owner: _, name: _, description: _, uri: _, price: _, for_sale: _, rarity: _, is_auction: _, auction_end: _, highest_bid: _, highest_bidder: _, min_bid_increment: _ } = nft;
             };
+        }
+
+
+        public entry fun reset_marketplace(account: &signer) acquires Marketplace, MarketplaceData {
+            let marketplace_addr = signer::address_of(account);
+            
+            // Move out and destructure Marketplace
+            let Marketplace { nfts } = move_from<Marketplace>(marketplace_addr);
+            
+            // Clean up NFTs vector
+            while (!vector::is_empty(&mut nfts)) {
+                let nft = vector::pop_back(&mut nfts);
+                let NFT { id: _, owner: _, name: _, description: _, uri: _, price: _, for_sale: _, rarity: _, is_auction: _, auction_end: _, highest_bid: _, highest_bidder: _, min_bid_increment: _ } = nft;
+            };
+            vector::destroy_empty(nfts);
+            
+            // Get next_offer_id before destructuring
+            let next_offer_id = borrow_global<MarketplaceData>(marketplace_addr).next_offer_id;
+            
+            // Move out MarketplaceData and clean up tables
+            let MarketplaceData { listings, offers, offer_escrow, next_offer_id: _ } = move_from<MarketplaceData>(marketplace_addr);
+            
+            // Clean up tables by removing all entries up to next_offer_id
+            let i = 0;
+            while (i < next_offer_id) {
+                if (table::contains(&listings, i)) {
+                    table::remove(&mut listings, i);
+                };
+                if (table::contains(&offers, i)) {
+                    table::remove(&mut offers, i);
+                };
+                i = i + 1;
+            };
+            
+            // Destroy coin
+            coin::destroy_zero(offer_escrow);
+            
+            // Initialize fresh marketplace with cleaned tables
+            move_to(account, Marketplace {
+                nfts: vector::empty()
+            });
+            
+            move_to(account, MarketplaceData {
+                listings,
+                offers,
+                offer_escrow: coin::zero<AptosCoin>(),
+                next_offer_id: 0
+            });
         }
 
 
@@ -638,10 +710,10 @@ address 0xa256fddba13780914e70b6f74cf24af7548e796ad8dcbf331c85c93327f99ec4{
             // Validate offer amount and buyer funds
             assert!(coin::balance<AptosCoin>(buyer_addr) >= offer_amount, ERROR_INSUFFICIENT_FUNDS);
             
-            // Lock offer amount
-            let offer_coins = coin::withdraw<AptosCoin>(buyer, offer_amount);
+            // Get marketplace data
+            let marketplace_data = borrow_global_mut<MarketplaceData>(marketplace_addr);
             
-            // Create and store offer
+            // Create offer
             let offer = Offer {
                 nft_id,
                 buyer: buyer_addr,
@@ -650,7 +722,14 @@ address 0xa256fddba13780914e70b6f74cf24af7548e796ad8dcbf331c85c93327f99ec4{
                 status: OFFER_STATUS_PENDING
             };
             
-            add_offer(marketplace_addr, nft_id, offer, offer_coins);
+            // Transfer coins to escrow
+            let offer_coins = coin::withdraw<AptosCoin>(buyer, offer_amount);
+            coin::merge(&mut marketplace_data.offer_escrow, offer_coins);
+            
+            // Store offer
+            let offer_id = marketplace_data.next_offer_id;
+            marketplace_data.next_offer_id = marketplace_data.next_offer_id + 1;
+            table::add(&mut marketplace_data.offers, offer_id, offer);
         }
 
         public entry fun accept_offer(
@@ -658,14 +737,15 @@ address 0xa256fddba13780914e70b6f74cf24af7548e796ad8dcbf331c85c93327f99ec4{
             marketplace_addr: address,
             nft_id: u64,
             offer_id: u64
-        ) acquires MarketplaceData {
+        ) acquires MarketplaceData, Marketplace {
             let seller_addr = signer::address_of(seller);
             let marketplace_data = borrow_global_mut<MarketplaceData>(marketplace_addr);
+            let marketplace = borrow_global_mut<Marketplace>(marketplace_addr);
 
-            // Verify seller owns the NFT
-            assert!(table::contains(&marketplace_data.listings, nft_id), ERROR_NFT_NOT_LISTED);
-            let listing = table::borrow(&marketplace_data.listings, nft_id);
-            assert!(listing.seller == seller_addr, ERROR_NOT_OWNER);
+            // Get and validate NFT ownership
+            let nft = vector::borrow_mut(&mut marketplace.nfts, nft_id);
+            assert!(nft.owner == seller_addr, ERROR_NOT_OWNER);
+            assert!(nft.for_sale, ERROR_NFT_NOT_LISTED);
 
             // Get and validate offer
             assert!(table::contains(&marketplace_data.offers, offer_id), ERROR_OFFER_NOT_FOUND);
@@ -673,26 +753,17 @@ address 0xa256fddba13780914e70b6f74cf24af7548e796ad8dcbf331c85c93327f99ec4{
             assert!(offer.status == OFFER_STATUS_PENDING, ERROR_OFFER_NOT_PENDING);
             assert!(timestamp::now_seconds() <= offer.expiration, ERROR_OFFER_EXPIRED);
 
-            // Transfer NFT to buyer using the correct function
-            token::transfer_with_opt_in(
-                seller,
-                listing.creator,
-                listing.collection,
-                listing.name,
-                0, // property_version
-                offer.buyer,
-                1  // amount
-            );
-
             // Transfer payment to seller
             let payment = coin::extract(&mut marketplace_data.offer_escrow, offer.amount);
             coin::deposit(seller_addr, payment);
 
+            // Update NFT ownership
+            nft.owner = offer.buyer;
+            nft.for_sale = false;
+            nft.price = 0;
+
             // Update offer status
             offer.status = OFFER_STATUS_ACCEPTED;
-
-            // Remove listing
-            table::remove(&mut marketplace_data.listings, nft_id);
 
             // Emit event
             event::emit(OfferAccepted {
@@ -703,8 +774,6 @@ address 0xa256fddba13780914e70b6f74cf24af7548e796ad8dcbf331c85c93327f99ec4{
                 amount: offer.amount
             });
         }
-
-
 
         public entry fun cancel_offer(
             buyer: &signer,
